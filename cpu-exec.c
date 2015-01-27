@@ -226,6 +226,9 @@ static void cpu_exec_nocache(CPUArchState *env, int max_cycles,
     tb_free(tb);
 }
 
+void afl_fork_faster_writer(target_ulong pc, target_ulong cs_base, uint64_t flags);
+
+
 static TranslationBlock *tb_find_slow(CPUArchState *env,
                                       target_ulong pc,
                                       target_ulong cs_base,
@@ -269,6 +272,7 @@ static TranslationBlock *tb_find_slow(CPUArchState *env,
     }
  not_found:
    /* if no translated code available, then translate it now */
+    afl_fork_faster_writer(pc, cs_base, flags);
     tb = tb_gen_code(cpu, pc, cs_base, flags, 0);
 
  found:
@@ -321,6 +325,242 @@ static void cpu_handle_debug_exception(CPUArchState *env)
 
 volatile sig_atomic_t exit_request;
 
+#define AFL_FORKSERVER_FD 198
+#define AFL_FORKFASTER_FD 200
+static u_int8_t *__afl_area_ptr;
+
+// must be sync'd with afl config.h ...
+#define MAP_SIZE_POW2       16
+#define MAP_SIZE            (1 << MAP_SIZE_POW2)
+
+#include <sys/shm.h>
+
+abi_ulong afl_entry_point;		// ELF entry point of the executable (_start)
+abi_ulong afl_start_code, afl_end_code;	// ELF .text start and finish
+int afl_instrument_all;
+int afl_forkserver_running;
+
+static void afl_fork_faster_reader(CPUArchState *env);
+static void afl_setup(void);
+static void afl_forkserver(CPUArchState *env);
+inline void afl_maybe_log(abi_ulong cur_loc);
+
+/*
+ * setup the AFL fuzzing support if it's ran under afl-fuzz
+ */
+
+static void afl_setup(void)
+{
+	char *shm_env;
+	static int has_ran_before;
+	int shm_id;
+
+	if(has_ran_before) {
+		qemu_log("afl_setup() - has_ran_before = true, unexpected. threading?\n");
+		exit(1);
+		// seems like this is fine so far.
+		//qemu_log("previously setup afl, returning\n");
+		return;
+	}
+
+	has_ran_before = 1;
+
+	if(getenv("AFL_QEMU_INSTRUMENT_ALL")) afl_instrument_all = 1;
+
+	shm_env = getenv("__AFL_SHM_ID");
+	if(! shm_env) {
+		qemu_log("getenv(__AFL_SHM_ID) is NULL\n");
+		return;
+	}
+	
+	shm_id = atoi(shm_env);
+	__afl_area_ptr = shmat(shm_id, NULL, 0);
+	if((size_t) __afl_area_ptr == -1) {
+		qemu_log("afl_setup() - __afl_area_ptr = NULL, bailing\n");
+		exit(1);
+	}
+
+}
+
+/*
+ * forkserver implementation - this is called when the entrypoint (_start)
+ * of the binary is reached.
+ */
+
+static void afl_forkserver(CPUArchState *env)
+{
+	char tmp[4];
+
+	memset(tmp, 0, sizeof(tmp));
+
+	if(write(AFL_FORKSERVER_FD + 1, tmp, sizeof(tmp)) != sizeof(tmp)) {
+		qemu_log("afl_forkserver() - failed indicating we exist!\n");
+		return;
+	}
+
+	afl_forkserver_running = 1;
+
+	while(1) {
+		pid_t pid;
+		u_int32_t wp;
+		int status;
+		int ff_fd[2];
+
+		if(read(AFL_FORKSERVER_FD, tmp, 4) != 4) {
+			qemu_log("afl_forkserver() - failed to read from afl, bailing\n");
+			exit(1);
+		}
+
+		/*
+		 * To implement the fork faster, we need an IPC mechanism between the parent and child.
+		 * Surprisingly, using pipes/read/write is pretty good, and probably doesn't need shared
+		 * memory and locking etc.
+		 */
+
+		if(pipe(ff_fd) == -1) {
+			qemu_log("pipe() failed\n");
+			exit(1);
+		}
+
+		// XXX, we'll assume AFL_FORKFASTER_FD isn't open already.
+
+		if(dup2(ff_fd[0], AFL_FORKFASTER_FD) == -1 || dup2(ff_fd[1], AFL_FORKFASTER_FD+1) == -1) {
+			qemu_log("dup2() failed\n");
+			exit(1);
+		}
+
+		close(ff_fd[0]);
+		close(ff_fd[1]);
+
+		pid = fork();
+
+		if(pid == -1) {
+			qemu_log("afl_forkserver() - failed to fork(), bailing\n");
+			exit(1);
+		}
+
+		if(pid == 0) { // child
+			close(AFL_FORKSERVER_FD);
+			close(AFL_FORKSERVER_FD + 1);
+
+			close(AFL_FORKFASTER_FD);
+
+			return;
+		}
+
+		// parent
+		close(AFL_FORKFASTER_FD + 1);
+
+		wp = pid;
+
+		if(write(AFL_FORKSERVER_FD + 1, &wp, sizeof(u_int32_t)) != sizeof(u_int32_t)) {
+			qemu_log("afl_forkserver() - failed to write pid to parent, bailing\n");
+			exit(1);
+		}
+
+		afl_fork_faster_reader(env);
+
+		if(waitpid(pid, &status, WUNTRACED) == -1) {
+			qemu_log("afl_forkserver() - failed to waitpid(), bailing\n");
+			exit(1);
+		}
+
+		wp = status;
+
+		if(write(AFL_FORKSERVER_FD + 1, &wp, sizeof(u_int32_t)) != sizeof(u_int32_t)) {
+			qemu_log("afl_forkserver() - failed to write() to afl, bailing\n");
+			exit(1);
+		}
+
+	}
+
+}
+
+
+inline void afl_maybe_log(abi_ulong cur_loc)
+{
+	static abi_ulong prev_loc;
+	int loc;
+
+	if(__afl_area_ptr == NULL) return;
+
+	if(! afl_instrument_all) {
+		if(cur_loc < afl_start_code || cur_loc > afl_end_code) {
+			qemu_log("afl_maybe_log(): not instrumenting " TARGET_ABI_FMT_lx "\n", cur_loc);
+			return;
+		}
+	}
+	qemu_log("afl_maybe_log(): instrumenting " TARGET_ABI_FMT_lx "\n", cur_loc);
+
+	// TL;DR: the instrumentation does shm_trace_map[cur_loc ^ prev_loc]++
+
+	// We have an abi_ulong.. we need to mash those X bits together to make a suitable 
+	// value for AFL instrumentation. Currently, we look at bottom 32 bits, and ignore
+	// 64 bit architectures. Some arch instructions may be X bit aligned, so we take 
+	// them into account as well.
+
+	cur_loc = ((cur_loc >> 16) ^ (cur_loc >> 2)) ^ (cur_loc & 0xffff);
+	cur_loc %= MAP_SIZE;
+
+	loc = cur_loc ^ prev_loc;
+
+	__afl_area_ptr[loc]++;
+	prev_loc = cur_loc >> 1;
+
+}
+
+typedef struct afl_ff_struct
+{
+	target_ulong pc;
+	target_ulong cs_base;
+	uint64_t flags;
+} afl_ff_t;
+
+/*
+ * Write the required information to the parent so they can translate the buffer
+ * as well, so on next fork() the child doesn't need to redo the translation
+ */
+
+void afl_fork_faster_writer(target_ulong pc, target_ulong cs_base, uint64_t flags)
+{
+	afl_ff_t ff;
+
+	if(! afl_forkserver_running) return;
+
+	ff.pc = pc;
+	ff.cs_base = cs_base;
+	ff.flags = flags;
+
+	if(write(AFL_FORKFASTER_FD+1, &ff, sizeof(afl_ff_t)) != sizeof(afl_ff_t)) {
+		// parent seems to have died?
+		qemu_log("parent dead?\n");
+		return;
+	}
+		
+}
+
+/*
+ * as the child hits untranslated code, it writes the required information to the parent
+ * so that the parent can make the next child process run faster
+ */
+
+void afl_fork_faster_reader(CPUArchState *env)
+{
+	afl_ff_t ff;
+	// TranslationBlock *tb;
+
+	while(1) {
+		if(read(AFL_FORKFASTER_FD, &ff, sizeof(afl_ff_t)) != sizeof(afl_ff_t)) return;
+
+		tb_find_slow(env, ff.pc, ff.cs_base, ff.flags);
+		// XXX, keep statistics of this?
+	}
+
+	close(AFL_FORKFASTER_FD);
+}
+
+
+
 int cpu_exec(CPUArchState *env)
 {
     CPUState *cpu = ENV_GET_CPU(env);
@@ -336,6 +576,11 @@ int cpu_exec(CPUArchState *env)
 
     /* This must be volatile so it is not trashed by longjmp() */
     volatile bool have_tb_lock = false;
+
+    if(! afl_entry_point) {
+        qemu_log("afl_entry_point not set - not expected use case, sorry!\n");
+        exit(1);
+    }
 
     if (cpu->halted) {
         if (!cpu_has_work(cpu)) {
@@ -463,6 +708,14 @@ int cpu_exec(CPUArchState *env)
                     next_tb = 0;
                     tcg_ctx.tb_ctx.tb_invalidated_flag = 0;
                 }
+
+		if(tb->pc == afl_entry_point) {
+			afl_setup();
+			afl_forkserver(env);
+		}
+
+		afl_maybe_log(tb->pc);
+
                 if (qemu_loglevel_mask(CPU_LOG_EXEC)) {
                     qemu_log("Trace %p [" TARGET_FMT_lx "] %s\n",
                              tb->tc_ptr, tb->pc, lookup_symbol(tb->pc));

@@ -1768,6 +1768,7 @@ exit_errmsg:
 #endif
 }
 
+extern abi_ulong afl_entry_point, afl_start_code, afl_end_code;
 
 /* Load an ELF image into the address space.
 
@@ -1882,6 +1883,8 @@ static void load_elf_image(const char *image_name, int image_fd,
     info->load_bias = load_bias;
     info->load_addr = load_addr;
     info->entry = ehdr->e_entry + load_bias;
+    if(! afl_entry_point) afl_entry_point = info->entry;
+
     info->start_code = -1;
     info->end_code = 0;
     info->start_data = -1;
@@ -1922,9 +1925,11 @@ static void load_elf_image(const char *image_name, int image_fd,
             if (elf_prot & PROT_EXEC) {
                 if (vaddr < info->start_code) {
                     info->start_code = vaddr;
+                    if(! afl_start_code) afl_start_code = info->start_code;
                 }
                 if (vaddr_ef > info->end_code) {
                     info->end_code = vaddr_ef;
+                    if(! afl_end_code) afl_end_code = info->end_code;
                 }
             }
             if (elf_prot & PROT_WRITE) {
